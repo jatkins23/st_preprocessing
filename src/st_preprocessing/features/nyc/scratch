@@ -1,0 +1,28 @@
+# FILE_LOCATIONS = {
+#     #'sts_hwy' : 'Street_and_Highway_Capital_Reconstruction_Projects_-_Intersection_20250721.csv',
+#     'traffic_calming' : 'VZV_Turn_Traffic_Calming_20250721.csv',
+#     'ped_plaza': 'NYC_DOT_Pedestrian_Plazas__Point_Feature__20250721.csv',
+#     'bike_parking': 'Bicycle_Parking_20250721.csv',
+#     'bus_lanes': 'Bus_Lanes_-_Local_Streets_20250721.csv',
+#     'ped_ramp': 'Pedestrian_Ramp_Locations_20250721.csv',
+#     'bike_rtes': 'New_York_City_Bike_Routes_20250722.csv',
+#     # 'capital_projects': 'Capital_Projects_20250720.csv', # no geodata. but still maybe useful
+#     'raised_xwalk': 'Raised_Crosswalk_Locations_20250721.csv',
+#     'constrx_str_close': 'Street_Closures_due_to_construction_activities_by_Block_20250722.csv',
+#     # 'bollards' : 'Traffic_Bollards_Tracking_and_Installations_20250722.csv', # only address
+#     'protected_strs' : 'Protected_Streets_Map_-_Block__Dataset__20250722.csv',
+#     'SIP_intx' : 'VZV_SIP_Intersections_20250722.csv',
+#     # 'bus_pad' : 'Bus_Pad_Tracking_20250722.csv', # need to be geotagged but not worth it
+#     'cap_projx' : 'Capital_Projects_20250720.csv',
+#     'speed_humps' : 'VZV_Speed_Humps_20250722.csv',
+# }
+
+
+# bike_joined = join_feature(node_buffers, cleaned_gdfs_p['bike_rtes'], feature_shorthand='bike')
+    # bus_joined = join_feature(node_buffers, cleaned_gdfs_p['bus_lanes'], feature_shorthand='bus')
+    # plaza_joined = join_feature(node_buffers, cleaned_gdfs_p['ped_plaza'], feature_shorthand='plaza')
+ 
+    #print(count_features_by_location(node_buffers, cleaned_gdfs_p['bike_rtes'], feature_shorthand='bike'))
+
+# Todo:
+# - move any constants to a config or maybe into constants.py?
