@@ -1,0 +1,7 @@
+data/
+.venv/
+.pytest_cache
+.env
+.python-version
+uv.lock
+*__pycache__
