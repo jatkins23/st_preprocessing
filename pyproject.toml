@@ -10,3 +10,9 @@ dependencies = [
     "pandas>=2.3.3",
     "shapely>=2.1.2",
 ]
+
+[dependency-groups]
+dev = [
+    "colorama>=0.4.6",
+    "geodatasets>=2024.8.0",
+]

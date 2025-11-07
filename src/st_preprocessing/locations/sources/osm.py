@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from ..universe import UniverseLoader
 import pandas as pd
 
-class LocationsOSMLoader(UniverseLoader):
+class OSMLoader(UniverseLoader):
     SOURCE = 'osm'
 
     def __init__(self, path: str, *, encoding: str|None=None) -> None:

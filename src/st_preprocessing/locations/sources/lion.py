@@ -1,79 +1,163 @@
-# functions for
-
 from __future__ import annotations
 
-from pathlib import Path
 import os
-import sys
-from dataclasses import dataclass
-from abc import ABC, abstractmethod
+import logging
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import geopandas as gpd
-from geopandas import GeoDataFrame
 import fiona
 
+import osmnx as ox
 from dotenv import load_dotenv
+
+from colorama import Fore, Style
+
 from ..universe import UniverseLoader
 
 load_dotenv()
 
 DATA_PATH = Path(str(os.getenv('DATA_PATH')))
 LION_PATH =  DATA_PATH / 'raw/locations/lion/lion.gdb'
-LION_LAYERS = {'nodes': 'nodes', 'node_names': 'node_stname', 'altnames': 'altnames','master': 'lion'}
-TEMP = {'nodes': 'node','node_names': 'node_stname'}
-layers_available = fiona.listlayers(LION_PATH)
 
-# class StreetNames: 
-#     pass
-    
-#     @classmethod
-#     def clean_street_names(cls):
-
-class LocationsLIONLoader(UniverseLoader):
+class LIONLoader(UniverseLoader):
     SOURCE = 'lion'
+    
+    def __init__(self, verbose:bool=False):
+        self.verbose=verbose
 
-    def __init__(self, path: str, *, encoding: str|None=None) -> None:
-        self.path = path
-        self.encoding = encoding
+    def load_basefiles(self, lion_path:Path=LION_PATH) -> dict[str, gpd.GeoDataFrame]:
+        # , layers:list[str]=fiona.listlayers(LION_PATH)
+        self.node = gpd.read_file(lion_path, layer='node', engine='pyogrio')
+        self.node_stname = gpd.read_file(lion_path, layer='node_stname', engine='pyogrio')
+        self.lion = gpd.read_file(lion_path, layer='lion', engine='pyogrio')
 
-    def _load_baselayers(lion_path:Path=LION_PATH, layers: dict[str, str]=LION_LAYERS) -> dict[str, gpd.GeoDataFrame]:
-        layers_dict = {}
-        for lyr_name, lyr_path in layers.items():
-            try:
-                layers_dict[lyr_name] = gpd.read_file(lion_path, layer=lyr_path)
-            except Exception as e:
-                raise ValueError(f'{lyr_path} not found! Only {", ".join(list(layers_available))}')
-            
-        return layers_dict
-            
-    def _clean_streetnames(x): # TODO: improve to actualy work correctly
-        if not isinstance(x, str):
-            return pd.NA
-        elif (x.endswith(' BOUNDARY')) or (' RAIL' in x) or ('SHORELINE' in x):
-            return pd.NA
+    def filter_and_clean(self): 
+        # Masks to filter LION
+        mask_roads = self.lion['FeatureTyp'].isin(['0']) # Mask only the roads
+        mask_road_paths = self.lion['FeatureTyp'].isin(['0', 'W']) # Also mask the walking paths
+
+        active_nodes = pd.concat([self.lion.loc[mask_road_paths,'NodeIDFrom'], self.lion.loc[mask_road_paths, 'NodeIDTo']]).unique().astype(int)
+        filtered_nodes = self.node[self.node['NODEID'].isin(active_nodes)]
+
+        filtered_edges = self.lion[mask_roads][['Street','FeatureTyp','NodeIDTo', 'NodeIDFrom', 'SegmentTyp', 'TrafDir', 'geometry']]
+        filtered_edges.loc[:, 'NodeIDFrom'] = filtered_edges['NodeIDFrom'].astype(int)
+        filtered_edges.loc[:, 'NodeIDTo'] = filtered_edges['NodeIDTo'].astype(int)
+
+        self.filtered_nodes = filtered_nodes
+        self.filtered_edges = filtered_edges
+
+    def to_graph(self, nodes:gpd.GeoDataFrame=None, edges:gpd.GeoDataFrame=None, save_path:Path|None=None, save_names:list[str]=['nodes.geojson','edges.geojson']) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+        if not nodes:
+            nodes = self.filtered_nodes
+        if not edges:
+            edges = self.filtered_edges
+        edges_indexed = (
+            edges
+            .explode(index_parts=True)
+            .rename({'NodeIDFrom': 'u', 'NodeIDTo': 'v'}, axis=1)
+            .set_index(['u','v'])
+        )
+
+        n = edges_indexed.groupby(level=[0,1]).cumcount()
+        edges_indexed = edges_indexed.set_index(n.rename('key'), append=True)
+
+        nodes_indexed = nodes.rename({'NODEID':'osmid'}, axis=1).set_index('osmid')
+        nodes_indexed['x'] = nodes_indexed['geometry'].x
+        nodes_indexed['y'] = nodes_indexed['geometry'].y
+
+        # self.nodes_indexed = nodes_indexed
+        # self.edges_indexed = edges_indexed
+        
+        graph = ox.graph_from_gdfs(
+            nodes_indexed,
+            edges_indexed
+        )
+
+        if save_path:
+            nodes_indexed.to_file(save_path / save_names[0])
+            edges_indexed.to_file(save_path / save_names[1])
+
+        self.graph = graph
+        return graph
+
+    def consolidate_intersections(self, tolerance:int=50, simplify:bool=True, save_path:Path|None=None, save_names:list[str]=['nodes_consolidated.geojson','edges_consolidated.geojson']):
+        if simplify:
+            g = ox.simplify_graph(self.graph)
         else:
-            return x.strip()
+            g = self.graph
         
-    # 1) Load the raw lion files
-    # 2) Handle StreetNames:
-    #   2.1) Filter streets based on type.
-    #   2.2) Clean the street names
-    #   2.3) Remove null street names
-    # 3) Merge the nodes and street names
-        # This should filter out the unnecessary nodes
-        #     
-        
-    def _load_raw(self):
-        # load in raw layers
-        layers = self._load_baselayers(LION_PATH, {'nodes': 'node','node_names': 'node_stname'})
+        self.graph_consolidated = ox.consolidate_intersections(self.graph, tolerance=tolerance, dead_ends=False)    
+        if save_path:
+            nodes, edges = ox.graph_to_gdfs(self.graph_consolidated)
+            nodes.to_file(save_path / save_names[0])
+            edges.to_file(save_path / save_names[1])
 
-        # Handle StreetNames
+    def assign_streetnames(self, nodes=None, edges=None, street_col:str='Street'):
+        if not nodes:
+            nodes, _ = ox.graph_to_gdfs(self.graph_consolidated)
+        if not edges:
+            _, edges = ox.graph_to_gdfs(self.graph_consolidated)
+
+        # Node Streetnames
+        def _node_to_streetnames(edges:gpd.GeoDataFrame, street_col:str):
+            def _flatten_array(x):
+                """
+                Flattens a numpy array that may contain nested lists or arrays.
+                Works recursively and returns a 1D numpy array.
+                """
+                # Convert to a Python list first (handles both np.ndarray and list)
+                if isinstance(x, np.ndarray):
+                    x = x.tolist()
+                
+                # Recursively flatten any nested lists
+                def _flatten(lst):
+                    for i in lst:
+                        if isinstance(i, (list, np.ndarray)):
+                            yield from _flatten(i)
+                        else:
+                            yield i
+            
+                return np.array(list(_flatten(x)), dtype=object)
+            
+            def _consolidate_streetnames(x, sort_by_freq:bool=True):
+                flattened = _flatten_array(np.array(x))
+                if sort_by_freq:
+                    ret = np.array(pd.Series(flattened).value_counts().index.to_list())
+                else:
+                    ret = np.unique(flattened)
+                return ret
+            
+            nodes_streetnames = pd.concat([
+                edges.reset_index()[['u', street_col]].rename({'u':'Node'}, axis=1),
+                edges.reset_index()[['v', street_col]].rename({'v':'Node'}, axis=1)
+            ]).groupby('Node').agg({street_col: _consolidate_streetnames})
         
-        print('loading from LION')
-        return pd.DataFrame({
-            # 'A': [1,2,3],
-            # 'B': [4,5,6],
-            'name': ['nyc','nyc','nyc'],
-            'source': ['lion','lion','lion'],
-        })
+            return nodes_streetnames
+
+        node_to_streetnames = _node_to_streetnames(edges=edges, street_col=street_col)
+        nodes_w_streetnames = nodes.merge(node_to_streetnames, left_index=True, right_index=True)
+        nodes_w_streetnames[nodes_w_streetnames[street_col].apply(len) > 1]
+        
+        return nodes_w_streetnames
+
+    def _load_raw(self, tolerance:int=30, save_path:Path|None=None, verbose:bool=True):
+        pipeline = [
+            ('Load Basefiles', self.load_basefiles, [], {}),
+            ('Filter and Clean', self.filter_and_clean, [], {}),
+            ('Convert to Graph', self.to_graph, [], {'save_path': save_path}),
+            ('Consolidate Intersections', self.consolidate_intersections, [], {'tolerance': tolerance, 'save_path': save_path}),
+            ('Assign Streetnames', self.assign_streetnames, [], {})    
+        ]
+        results = {}
+        for name, func, args, kwargs in pipeline:
+            try:
+                results[name] = func(*args, **kwargs)
+                if verbose:
+                    arr_len = len('Consolidate Intersections') - len(name) + 4
+                    print(f'LION -- {name} {'-' *  arr_len}> {Fore.GREEN}Completed{Style.RESET_ALL}.')
+            except Exception as e:
+                print(f'LION -- {name} {'-' *  arr_len}> {Fore.RED}Failed{Style.RESET_ALL}: {e}')
+        
+        return results[[x[0] for x in pipeline][-1]]

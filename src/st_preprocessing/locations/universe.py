@@ -40,7 +40,7 @@ class UniverseLoader(ABC):
         # Auto-register subclasses that define a SOURCE string
         source = getattr(cls, "SOURCE", None)
         if source:
-            key = source.lower()
+            key = str(source).lower()
             if key in UniverseLoader._REGISTRY and UniverseLoader._REGISTRY[key] is not cls:
                 raise RuntimeError(f"Duplicate loader SOURCE '{key}' for {cls.__name__}")
             UniverseLoader._REGISTRY[key] = cls
@@ -59,8 +59,7 @@ class UniverseLoader(ABC):
             ) from e
         
         loader = loader_cls(**kwargs)
-        loader.load() # already normalized & validated
-        #return df
+        return loader.load()
     
     def load(self) -> pd.DataFrame:
         """
@@ -86,7 +85,7 @@ class UniverseLoader(ABC):
         # Convert models to plain dicts and build a normalized DataFrame
         return pd.DataFrame([m.model_dump() for m in models])
 
-    @abstractmethod
+    @staticmethod
     def interpret_boundary(universe_boundary:str|Path|Polygon|gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         if isinstance(universe_boundary, (Polygon, gpd.GeoDataFrame)):
             bounds=universe_boundary
@@ -112,7 +111,7 @@ class UniverseLoader(ABC):
 
     @abstractmethod
     def _load_raw(self) -> Iterable[dict[str, Any]]:
-        ...
+        pass
         
     
 
