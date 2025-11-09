@@ -15,15 +15,17 @@ from shapely.geometry import Polygon
 from pydantic import BaseModel, ValidationError, TypeAdapter
 
 from ..utils.errors import DataValidationError
+from .location import Location
 
 logger = logging.getLogger('UniverseLoader')
 
 class Universe(BaseModel):
     name: str
     source: str
+    locations: Iterable[Location]
 
 class UniverseLoader(ABC):
-    """Abstract base for locationSet loaders.
+    """Abstract base for Universe loaders.
     Subclasses will set a SOURCE and implement a `_load_raw()` function to return
     the necessary data objects
     """
@@ -68,19 +70,22 @@ class UniverseLoader(ABC):
         Right now it just prints
         """
         raw = self._load_raw()
+        print(raw.columns)
 
         rows = raw.to_dict(orient="records") if isinstance(raw, pd.DataFrame) else list(raw)
         
         # Validate
-        adapter = TypeAdapter(list[Universe])
+        # adapter = TypeAdapter(list[Location])
         try: 
-            models: list[Universe] = adapter.validate_python(rows, from_attributes=True)
+            print(rows[0:3])
+            #models: list[Location] = adapter.validate_python(rows, from_attributes=True, by_name=True, )
+            models: list[Location] = [Location.model_validate(r, strict=False, by_name=True) for r in rows]
         except ValidationError as e:
             logger.error(
                 'Universe validation failed',
                 extra={"source": self.SOURCE, "error_count": len(e.errors())}
             )
-            raise DatasetValidationError(self.SOURCE, e.errors(), original=e)
+            raise DataValidationError(self.SOURCE, e.errors(), original=e)
 
         # Convert models to plain dicts and build a normalized DataFrame
         return pd.DataFrame([m.model_dump() for m in models])
@@ -111,7 +116,6 @@ class UniverseLoader(ABC):
 
     @abstractmethod
     def _load_raw(self) -> Iterable[dict[str, Any]]:
-        pass
+        ...
         
-    
 

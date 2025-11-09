@@ -21,6 +21,10 @@ load_dotenv()
 DATA_PATH = Path(str(os.getenv('DATA_PATH')))
 LION_PATH =  DATA_PATH / 'raw/locations/lion/lion.gdb'
 
+from dataclasses import dataclass
+from typing import Optional, Any
+from networkx import Graph
+
 class LIONLoader(UniverseLoader):
     SOURCE = 'lion'
     
@@ -139,8 +143,33 @@ class LIONLoader(UniverseLoader):
         node_to_streetnames = _node_to_streetnames(edges=edges, street_col=street_col)
         nodes_w_streetnames = nodes.merge(node_to_streetnames, left_index=True, right_index=True)
         nodes_w_streetnames[nodes_w_streetnames[street_col].apply(len) > 1]
+
+        self.nodes_w_streetnames = nodes_w_streetnames
         
         return nodes_w_streetnames
+    
+    def convert_to_universe(self): 
+        def _get_column_list_index(x, i):
+            if i < len(x):
+                return x[i]
+            else:
+                return pd.NA
+        temp = self.nodes_w_streetnames.copy()
+        temp['street1'] = temp['Street'].apply(_get_column_list_index, i=0)
+        temp['street2'] = temp['Street'].apply(_get_column_list_index, i=1)
+
+        nodes_converted = temp.reset_index().rename(columns = {
+            'index': 'location_id',
+            'osmid_original': 'original_nodeids',
+            'Street': 'additional_streets'
+        })
+
+        nodes_converted['original_nodeids'] = nodes_converted['original_nodeids'].apply(lambda x: x if isinstance(x, list) else [x])
+
+        nodes_converted = nodes_converted[['location_id', 'street1','street2','additional_streets','original_nodeids','street_count','geometry']]
+        # nodes_converted = nodes_converted[['location_id','street1','street2']]#,'geometry']]
+
+        return nodes_converted
 
     def _load_raw(self, tolerance:int=30, save_path:Path|None=None, verbose:bool=True):
         pipeline = [
@@ -148,7 +177,8 @@ class LIONLoader(UniverseLoader):
             ('Filter and Clean', self.filter_and_clean, [], {}),
             ('Convert to Graph', self.to_graph, [], {'save_path': save_path}),
             ('Consolidate Intersections', self.consolidate_intersections, [], {'tolerance': tolerance, 'save_path': save_path}),
-            ('Assign Streetnames', self.assign_streetnames, [], {})    
+            ('Assign Streetnames', self.assign_streetnames, [], {}),
+            ('Convert to Universe', self.convert_to_universe, [], {})
         ]
         results = {}
         for name, func, args, kwargs in pipeline:
@@ -161,3 +191,13 @@ class LIONLoader(UniverseLoader):
                 print(f'LION -- {name} {'-' *  arr_len}> {Fore.RED}Failed{Style.RESET_ALL}: {e}')
         
         return results[[x[0] for x in pipeline][-1]]
+
+
+# @dataclass
+# class LionState:
+#     node: Optional[gpd.GeoDataFrame] = None
+#     node_stname: Optional[gpd.GeoDataFrame] = None
+#     lion: Optional[gpd.GeoDataFrame] = None
+#     graph: Optional[Graph] = None
+#     intersections: Optional[gpd.GeoDataFrame] = None
+#     universe: Optional[Any] = None
