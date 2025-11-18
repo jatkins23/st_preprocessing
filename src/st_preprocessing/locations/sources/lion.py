@@ -21,10 +21,6 @@ load_dotenv()
 DATA_PATH = Path(str(os.getenv('DATA_PATH')))
 LION_PATH =  DATA_PATH / 'raw/locations/lion/lion.gdb'
 
-from dataclasses import dataclass
-from typing import Optional, Any
-from networkx import Graph
-
 class LIONLoader(UniverseLoader):
     SOURCE = 'lion'
     

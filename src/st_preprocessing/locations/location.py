@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from typing import Optional, Iterable
+from typing import Optional
 from shapely.geometry import Point
 from pydantic import BaseModel, ConfigDict
 

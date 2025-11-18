@@ -6,3 +6,4 @@ data/
 uv.lock
 *__pycache__
 src/st_preprocessing.egg-info/
+notebooks/cache
