@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import logging
 from pathlib import Path
+from typing import Any, Iterable, Callable
 
 import numpy as np
 import pandas as pd
@@ -12,20 +13,38 @@ import fiona
 import osmnx as ox
 from dotenv import load_dotenv
 
-from colorama import Fore, Style
-
 from ..universe import UniverseLoader
+from ...utils.nyc_geocoding.normalizers import StreetNormalizer
+from ...pipeline_mixin import PipelineMixin
 
 load_dotenv()
 
 DATA_PATH = Path(str(os.getenv('DATA_PATH')))
 LION_PATH =  DATA_PATH / 'raw/locations/lion/lion.gdb'
 
-class LIONLoader(UniverseLoader):
+class LIONLoader(UniverseLoader, PipelineMixin):
+    """Load universe locations from NYC LION dataset.
+
+    Uses pipeline pattern for multi-step processing:
+    1. Load base files (nodes, edges)
+    2. Filter and clean data
+    3. Convert to graph
+    4. Consolidate intersections
+    5. Assign street names
+    6. Clean/normalize street names
+    7. Convert to universe format
+    """
+
     SOURCE = 'lion'
-    
-    def __init__(self, verbose:bool=False):
-        self.verbose=verbose
+    CRS = '2263'
+
+    def __init__(self, **kwargs: Any):
+        """Initialize LIONLoader.
+
+        Args:
+            **kwargs: Optional parameters (currently unused, for compatibility with from_source())
+        """
+        pass
 
     def load_basefiles(self, lion_path:Path=LION_PATH) -> dict[str, gpd.GeoDataFrame]:
         # , layers:list[str]=fiona.listlayers(LION_PATH)
@@ -144,6 +163,15 @@ class LIONLoader(UniverseLoader):
         
         return nodes_w_streetnames
     
+    
+    def clean_streetnames(self):
+        # TODO: implement with Normalize
+        s_n = StreetNormalizer()
+
+        self.nodes_w_streetnames['Street'] = self.nodes_w_streetnames['Street'].apply(s_n.normalize_batch)
+
+        return self.nodes_w_streetnames
+
     def convert_to_universe(self): 
         def _get_column_list_index(x, i):
             if i < len(x):
@@ -165,35 +193,43 @@ class LIONLoader(UniverseLoader):
         nodes_converted = nodes_converted[['location_id', 'street1','street2','additional_streets','original_nodeids','street_count','geometry']]
         # nodes_converted = nodes_converted[['location_id','street1','street2']]#,'geometry']]
 
+        # Make GeoDataFrame
+        nodes_converted = gpd.GeoDataFrame(nodes_converted, crs=self.CRS).to_crs('4326')
+
         return nodes_converted
 
-    def _load_raw(self, tolerance:int=30, save_path:Path|None=None, verbose:bool=True):
+    def _load_pipeline(self, tolerance:int=30, save_path:Path|None=None) -> Iterable[tuple[str, Callable, list, dict[str, any]]]:
+        """Define the processing pipeline for LION data.
+
+        Args:
+            tolerance: Distance tolerance for consolidating intersections (meters)
+            save_path: Optional path to save intermediate results
+
+        Returns:
+            List of pipeline steps: (name, function, args, kwargs)
+        """
         pipeline = [
             ('Load Basefiles', self.load_basefiles, [], {}),
             ('Filter and Clean', self.filter_and_clean, [], {}),
             ('Convert to Graph', self.to_graph, [], {'save_path': save_path}),
             ('Consolidate Intersections', self.consolidate_intersections, [], {'tolerance': tolerance, 'save_path': save_path}),
             ('Assign Streetnames', self.assign_streetnames, [], {}),
+            ('Clean Streetnames', self.clean_streetnames, [], {}),
             ('Convert to Universe', self.convert_to_universe, [], {})
         ]
-        results = {}
-        for name, func, args, kwargs in pipeline:
-            try:
-                results[name] = func(*args, **kwargs)
-                if verbose:
-                    arr_len = len('Consolidate Intersections') - len(name) + 4
-                    print(f'LION -- {name} {'-' *  arr_len}> {Fore.GREEN}Completed{Style.RESET_ALL}.')
-            except Exception as e:
-                print(f'LION -- {name} {'-' *  arr_len}> {Fore.RED}Failed{Style.RESET_ALL}: {e}')
-        
-        return results[[x[0] for x in pipeline][-1]]
+        return pipeline
 
+    def _load_raw(self, tolerance:int=30, save_path:Path|None=None) -> gpd.GeoDataFrame:
+        """Load raw LION data by executing the pipeline.
 
-# @dataclass
-# class LionState:
-#     node: Optional[gpd.GeoDataFrame] = None
-#     node_stname: Optional[gpd.GeoDataFrame] = None
-#     lion: Optional[gpd.GeoDataFrame] = None
-#     graph: Optional[Graph] = None
-#     intersections: Optional[gpd.GeoDataFrame] = None
-#     universe: Optional[Any] = None
+        Args:
+            tolerance: Distance tolerance for consolidating intersections (meters)
+            save_path: Optional path to save intermediate results
+
+        Returns:
+            GeoDataFrame with universe location data
+        """
+        return self._execute_pipeline(
+            tolerance=tolerance,
+            save_path=save_path
+        )

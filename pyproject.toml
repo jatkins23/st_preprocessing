@@ -5,15 +5,26 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    "dotenv>=0.9.9",
+    "duckdb>=1.4.2",
+    "fiona>=1.10.1",
     "geopandas>=1.1.1",
+    "matplotlib>=3.10.7",
     "mercantile>=1.2.1",
     "osmnx>=2.0.6",
     "pandas>=2.3.3",
+    "pydantic>=2.12.4",
+    "pydantic-settings>=2.12.0",
     "shapely>=2.1.2",
 ]
 
 [dependency-groups]
 dev = [
+    "branca>=0.8.2",
     "colorama>=0.4.6",
+    "fiona>=1.10.1",
+    "folium>=0.20.0",
     "geodatasets>=2024.8.0",
+    "mapclassify>=2.10.0",
+    "pytest>=9.0.1",
 ]
