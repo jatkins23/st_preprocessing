@@ -26,6 +26,8 @@ class DocumentFile(BaseModel):
 class DocumentCollection(BaseModel):
     document_collection_id: int
     document_file_id: int
+    year: int
+
 
 
 class DocumentsLoader(ABC):

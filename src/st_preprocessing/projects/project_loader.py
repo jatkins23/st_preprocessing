@@ -1,4 +1,10 @@
 # Load project-specific data from a city agency
 
-class ProjectLoader:
-    pass
+from abc import ABC
+
+class ProjectLoader(ABC):
+    
+    def clip_to_universe():
+        pass
+
+# Abstract base class and superclass that has 

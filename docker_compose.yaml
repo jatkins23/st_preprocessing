@@ -1,0 +1,14 @@
+# docker-compose.yml
+services:
+  street:
+    build: .
+    container_name: st-preprocessing
+    environment:
+      DATA_PATH: /data              # matches the mount target
+    volumes:
+      - ./data:/data                # reuse host data
+      - ./pipeline/download-pipeline:/dagster-pipeline # <--- what do I do here?
+    working_dir: /dagster-pipeline
+    command: ["dagster", "dev", "-h", "0.0.0.0", "-p", "3000"]
+    ports:
+      - "3000:3000"

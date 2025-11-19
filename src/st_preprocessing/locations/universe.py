@@ -2,7 +2,7 @@
 # -- Maybe rename to 'Region'
 from __future__ import annotations
 
-from typing import Any, ClassVar, Type, Iterable
+from typing import Any, ClassVar, Type, Iterable, Mapping
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -12,7 +12,7 @@ import osmnx as ox
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Polygon
-from pydantic import BaseModel, ValidationError, TypeAdapter
+from pydantic import BaseModel, ValidationError
 
 from ..utils.errors import DataValidationError
 from .location import Location
@@ -20,9 +20,11 @@ from .location import Location
 logger = logging.getLogger('UniverseLoader')
 
 class Universe(BaseModel):
-    name: str
-    source: str
-    locations: Iterable[Location]
+    name: str # nyc
+    source: str # nyc
+    locations: Iterable[Location] # gdf
+    images: Path # to duckdb table
+
 
 class UniverseLoader(ABC):
     """Abstract base for Universe loaders.
@@ -62,23 +64,9 @@ class UniverseLoader(ABC):
         
         loader = loader_cls(**kwargs)
         return loader.load()
-    
-    def load(self) -> pd.DataFrame:
-        """
-        High-level load: subclasses provide raw records;
-        base class validates & normalizes to a consistent Dataframe
-        Right now it just prints
-        """
-        raw = self._load_raw()
-        print(raw.columns)
 
-        rows = raw.to_dict(orient="records") if isinstance(raw, pd.DataFrame) else list(raw)
-        
-        # Validate
-        # adapter = TypeAdapter(list[Location])
+    def _validate(self, rows:Iterable) -> None:
         try: 
-            print(rows[0:3])
-            #models: list[Location] = adapter.validate_python(rows, from_attributes=True, by_name=True, )
             models: list[Location] = [Location.model_validate(r, strict=False, by_name=True) for r in rows]
         except ValidationError as e:
             logger.error(
@@ -86,9 +74,24 @@ class UniverseLoader(ABC):
                 extra={"source": self.SOURCE, "error_count": len(e.errors())}
             )
             raise DataValidationError(self.SOURCE, e.errors(), original=e)
+        
+        return models
+
+    def load(self) -> pd.DataFrame:
+        """
+        High-level load: subclasses provide raw records;
+        base class validates & normalizes to a consistent Dataframe
+        Right now it just prints
+        """
+        # Load Raw
+        raw = self._load_raw()
+        
+        # Validate and coerce
+        rows = raw.to_dict(orient="records") if isinstance(raw, pd.DataFrame) else list(raw)
+        model_instances = self.validate(rows)
 
         # Convert models to plain dicts and build a normalized DataFrame
-        return pd.DataFrame([m.model_dump() for m in models])
+        return pd.DataFrame([m.model_dump() for m in model_instances])
 
     @staticmethod
     def interpret_boundary(universe_boundary:str|Path|Polygon|gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -103,7 +106,7 @@ class UniverseLoader(ABC):
 
         return bounds
 
-    def clip_by_boundary(self, locations, universe_boundary):
+    def clip_by_boundary(self, universe_boundary):
         bounds = self.interpret_boundary(universe_boundary)
         if bounds is not None:
             locations_clipped = self.locations.clip(
@@ -115,7 +118,11 @@ class UniverseLoader(ABC):
         return locations_clipped
 
     @abstractmethod
-    def _load_raw(self) -> Iterable[dict[str, Any]]:
+    def _load_raw(self) -> Iterable[Location | Mapping[str, Any]]:
         ...
         
 
+
+
+class NYC_Universe(Universe):
+    modalities = 
