@@ -133,11 +133,38 @@ class DataLoader(ABC):
             else:
                 full_name = table_name
 
+            # Handle GeoDataFrame geometry column
+            geom_col = None
+            if isinstance(df, gpd.GeoDataFrame) and df.geometry is not None:
+                geom_col = df.geometry.name
+                # Convert to regular DataFrame and replace geometry with WKT
+                df_to_save = pd.DataFrame(df.drop(columns=[geom_col]))
+                df_to_save[geom_col] = df.geometry.apply(
+                    lambda geom: geom.wkt if geom is not None else None
+                )
+            else:
+                df_to_save = df.copy()
+
             # Register DataFrame and create table
-            db_con.register("_tmp_gdf", df)
+            db_con.register("_tmp_gdf", df_to_save)
             try:
                 db_con.execute(f"DROP TABLE IF EXISTS {full_name};")
-                db_con.execute(f"CREATE TABLE {full_name} AS SELECT * FROM _tmp_gdf;")
+
+                # If GeoDataFrame, convert WKT to geometry in the table
+                if geom_col:
+                    # Get all non-geometry columns
+                    other_cols = [col for col in df_to_save.columns if col != geom_col]
+                    cols_select = ", ".join(other_cols)
+
+                    db_con.execute(f"""
+                        CREATE TABLE {full_name} AS
+                        SELECT {cols_select},
+                               ST_GeomFromText({geom_col}) AS {geom_col}
+                        FROM _tmp_gdf
+                    """)
+                else:
+                    db_con.execute(f"CREATE TABLE {full_name} AS SELECT * FROM _tmp_gdf;")
+
                 logger.info(f"Saved {len(df)} rows to {full_name}")
             finally:
                 db_con.unregister("_tmp_gdf")

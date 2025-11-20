@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Type, Iterable, Mapping, Callable
 import logging
-import os
-import json
-import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -16,20 +13,44 @@ import geopandas as gpd
 from shapely.geometry import Polygon
 from shapely.geometry.base import BaseGeometry
 from pydantic import BaseModel, ValidationError
+import mercantile
 
 from ..utils.errors import DataValidationError
 from .location import Location
+from .location_geometry import LocationGeometry
 from ..data_loader import DataLoader
+from ..db.db import duckdb_connection, load_wkt_gdf
 
 logger = logging.getLogger('UniverseLoader')
 
-class Universe(BaseModel):
-    name: str # nyc
-    source: str # nyc
-    locations: Iterable[Location] # gdf
-    images: Path # to duckdb table
+class Universe(BaseModel, arbitrary_types_allowed=True):
+    # TODO: turn locations and location_geometries into Iterables. Make properties out of location_gdf and location_geometries_gdf
+    source:                 str # nyc
+    name:                   str | None = None # If name isn't given, make it source
+    locations:              gpd.GeoDataFrame | None = None # Iterable[Location]
+    location_geometries:    pd.DataFrame | None = None # Iterable[LocationGeometry]
+    location_image_paths:   Path | None = None
 
+    def model_post_init(self, __context):
+        if not self.name:
+            self.name = self.source
 
+    # # TODO: turn into properties
+    # def get_locations(self):
+    #     with duckdb_connection() as db_con:
+    #         locations_gdf = load_wkt_gdf(db_con, table_name=f'{self.name}.locations', geom_col='geometry')
+    #         locations: list[Location] = [Location.model_validate(r, strict=False, by_name=True) for r in locations_gdf.to_dict(orient='rows')]
+    #     return locations_gdf, locations
+    
+    # def get_location_geometries(self):
+    #     with duckdb_connection() as db_con:
+    #         try:
+    #             df = db_con.execute(f"SELECT * FROM {self.name}.location_geometries;").df()
+    #         except Exception as e:
+    #             logger.ERROR(e)
+    #             return None
+    #     return df
+            
 class UniverseLoader(DataLoader):
     """Abstract base for Universe loaders.
 
@@ -65,40 +86,22 @@ class UniverseLoader(DataLoader):
             if key in UniverseLoader._REGISTRY and UniverseLoader._REGISTRY[key] is not cls:
                 raise RuntimeError(f"Duplicate loader SOURCE '{key}' for {cls.__name__}")
             UniverseLoader._REGISTRY[key] = cls
-            logger.debug(f"Registered UniverseLoader: {cls.__name__} as '{key}'")
-
-    def load(self) -> pd.DataFrame:
-        """High-level load: subclasses provide raw records;
-        base class validates & normalizes to a consistent DataFrame.
-
-        Returns:
-            Validated and normalized DataFrame of locations
-        """
-        # Load raw data
-        raw = self._load_raw()
-
-        # Validate and coerce
-        rows = raw.to_dict(orient="records") if isinstance(raw, pd.DataFrame) else list(raw)
-        model_instances = self._validate(rows)
-
-        # Convert models to plain dicts and build a normalized DataFrame
-        df = pd.DataFrame([m.model_dump() for m in model_instances])
-
-        return df
+            logger.debug(f"Registered UniverseLoader: {cls.__name__} as '{key}'")  
 
     @classmethod
-    def from_source(cls, source: str, **kwargs: Any) -> pd.DataFrame:
-        """Factory to dispatch registered subclass by `source`.
+    def from_source(cls, source: str, persist: bool = True, **kwargs: Any) -> pd.DataFrame:
+        """Factory to load universe from source.
 
         Args:
-            source: The source identifier (e.g., 'nyc', 'sf', 'boston')
-            **kwargs: Arguments passed to the loader's __init__
+            source: The source identifier (e.g., 'lion', 'sf', 'boston')
+            persist: Whether to perist to database (default: True)
+            **kwargs: Arguments passed to load methods
 
         Returns:
-            Loaded and validated DataFrame of locations
+            Universe object
 
         Example:
-            locations = UniverseLoader.from_source('nyc')
+            locations = UniverseLoader.from_source('lion')
         """
         key = str(source).lower()
         try:
@@ -108,119 +111,186 @@ class UniverseLoader(DataLoader):
                 f"Unknown source '{source}'. "
                 f"Known sources: {sorted(cls._REGISTRY.keys())}"
             ) from e
+        
+        loader = loader_cls()
 
-        loader = loader_cls(**kwargs)
-        return loader.load()
+        if kwargs.get('with_geometries', True):
+            universe = loader.load_with_geometries(**kwargs)
+        else:
+            universe = loader.load(**kwargs)
 
-    def _validate(self, rows:Iterable) -> None:
-        # Validates the model against a Location
-        try: 
-            models: list[Location] = [Location.model_validate(r, strict=False, by_name=True) for r in rows]
+        # Optionall persist
+        if persist:
+            loader.persist(universe)
+
+        return loader.load(**kwargs)
+
+    def load(self, **kwargs) -> Universe:
+        """Load universe data from source.
+        Returns clean Universe object without side effects.
+        """
+        # 1. Load raw data
+        raw_gdf = self._load_raw()
+
+        # 2. Validate
+        locations = self._validate_locations(raw_gdf)
+
+        # 3. Create Universe
+        uni = Universe(
+            source=self.SOURCE,
+            name=kwargs.get('universe_name', self.SOURCE),
+            locations=locations
+        )
+
+        return uni
+
+    def load_with_geometries(
+        self,
+        tile_width: int = 3,
+        zlevel: int = 20,
+        **kwargs
+    ) -> Universe:
+        """Load universe with location geometries."""
+        uni = self.load(**kwargs)
+
+        # Create location geometries
+        location_geoms = self._create_location_geometries(
+            uni.locations,
+            tile_widt=tile_width,
+            zlevel=zlevel
+        )
+
+        uni.location_geometries = location_geoms
+        
+        return uni
+
+    def persist(
+            self,
+            universe: Universe,
+            write_locations: bool = True,
+            write_geometries: bool = True
+    ) -> None:
+        """
+            Persist universe to database.
+            Separated from loading for better testability and flexibility.
+        """
+        if write_locations and universe.locations is not None:
+            super().to_database(
+                df=universe.locations,
+                table_name='locations',
+                schema_name=universe.name
+            )
+        
+        if write_geometries and universe.location_geometries is not None:
+            super().to_database(
+                df=universe.location_geometries,
+                table_name='location_geometries',
+                schema_name=universe.name
+            )
+        
+    @classmethod
+    def from_database(cls, universe_name: str, source: str | None=None) -> Universe:
+        """
+            Load universe from database.
+        """
+        if source is None and universe_name.lower() in cls._REGISTRY.keys():
+            source = universe_name
+
+        if source.lower() not in cls._REGISTRY.keys():
+            logger.error(
+                'Source not in '
+            )
+
+        with duckdb_connection() as db_con:
+            locations_gdf = load_wkt_gdf(
+                db_con,
+                table_name='locations',
+                table_schema=universe_name,
+                geom_col='geometry'
+            )
+
+            try:
+                location_geoms_df = db_con.execute(
+                    f"SELECT * FROM {universe_name}.location_geometries;"
+                ).df()
+            except Exception:
+                location_geoms_df = None
+
+        return Universe(
+            source=universe_name,
+            name=universe_name,
+            locations=locations_gdf
+        )
+
+    def _validate_df_to_models(self, raw_df: gpd.GeoDataFrame|pd.DataFrame, model: BaseModel) -> Iterable[BaseModel]:
+        """Validate dataframe with given pydantic model."""
+        rows = raw_df.to_dict(orient='records')
+        try:
+            location_models = [
+                model.model_validate(r, strict=False)
+                for r in rows
+            ]
+            return location_models
         except ValidationError as e:
             logger.error(
-                'Universe validation failed',
-                extra={"source": self.SOURCE, "error_count": len(e.errors())}
+                'Validation for df of {model.__name__} failed',
+                extra={'source': self.SOURCE, 'error_count': len(e.errors())}
             )
             raise DataValidationError(self.SOURCE, e.errors(), original=e)
+
+    def _validate_locations(self, raw_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """Validate locations against Location model."""
+        # Validate model
+        location_models = self._validate_df_to_models(raw_gdf, Location)
+
+        # Return as GeoDataFrame
+        validated_data = [m.model_dump() for m in location_models]
+        return gpd.GeoDataFrame(validated_data, crs=raw_gdf.crs)
+
+    def _create_location_geometries(
+        self,
+        locations_gdf: gpd.GeoDataFrame,
+        tile_width: int,
+        zlevel: int
+    ) -> pd.DataFrame:
+        """Create LocationGeometry objects from locations."""
+        # Ensure WGS84 for centroid extraction
+        if locations_gdf.crs != 'EPSG:4326':
+            locations_gdf = locations_gdf.to_crs('EPSG:4326')
         
-        return models
+        location_models = _validate_df_to_models(locations_gdf, Location) # This can be handled again with the universe @property
+        location_geom_instances = [
+            LocationGeometry(location_id=loc['location_id'], centroid=(loc['geometry'].x, loc['geometry'].y), tile_width=tile_width, zlevel=zlevel, proj_crs=self.CRS) 
+            for loc in location_models
+        ]
+        location_geoms = pd.DataFrame([lg.model_dump() for lg in location_geom_instances])
 
-    @staticmethod
-    def interpret_boundary(universe_boundary:str|Path|Polygon|gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-        if isinstance(universe_boundary, (Polygon, gpd.GeoDataFrame)):
-            bounds=universe_boundary
-        elif isinstance(universe_boundary, str) and os.path.exists(universe_boundary):
-            bounds = gpd.read_file(Path(str(universe_boundary)))
-        elif str(universe_boundary) in ['nyc','all']:
-            bounds = None
-        else: # Geocodable address
-            bounds = ox.geocoder.geocode_to_gdf(str(universe_boundary))
-
-        return bounds
-
-    def clip_by_boundary(self, universe_boundary):
-        bounds = self.interpret_boundary(universe_boundary)
-        if bounds is not None:
-            locations_clipped = self.locations.clip(
-                bounds.to_crs(self.locations.crs)
-            )
-        else:
-            locations_clipped = self.locations
-
-        return locations_clipped
-
+        return location_geoms
+    
     @abstractmethod
     def _load_pipeline(self, **kwargs) -> Iterable[tuple[str, Callable, list, dict[str, any]]]:
         ...
 
-    # def _to_database(self, df: pd.DataFrame | None = None) -> None:
-    #     """Save universe locations to database.
+    # @staticmethod
+    # def interpret_boundary(universe_boundary:str|Path|Polygon|gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    #     if isinstance(universe_boundary, (Polygon, gpd.GeoDataFrame)):
+    #         bounds=universe_boundary
+    #     elif isinstance(universe_boundary, str) and os.path.exists(universe_boundary):
+    #         bounds = gpd.read_file(Path(str(universe_boundary)))
+    #     elif str(universe_boundary) in ['nyc','all']:
+    #         bounds = None
+    #     else: # Geocodable address
+    #         bounds = ox.geocoder.geocode_to_gdf(str(universe_boundary))
 
-    #     Default implementation does nothing.
-    #     Subclasses can override to implement database persistence.
-    #     """
-    #     if df is None or df.empty:
-    #         return
+    #     return bounds
 
-    #     db_path = os.getenv("DDB_PATH")
-    #     if db_path is None:
-    #         db_path = Path(__file__).resolve().parents[3] / "data" / "core.ddb"
+    # def clip_by_boundary(self, universe_boundary):
+    #     bounds = self.interpret_boundary(universe_boundary)
+    #     if bounds is not None:
+    #         locations_clipped = self.locations.clip(
+    #             bounds.to_crs(self.locations.crs)
+    #         )
     #     else:
-    #         db_path = Path(db_path)
-
-    #     db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    #     try:
-    #         import duckdb
-    #     except ImportError:
-    #         logger.info("DuckDB not installed; skipping persistence for '%s'.", self.SOURCE)
-    #         return
-
-    #     prepared = df.copy()
-
-    #     def _is_missing(value: Any) -> bool:
-    #         if value is None:
-    #             return True
-    #         try:
-    #             result = pd.isna(value)
-    #         except (TypeError, ValueError):
-    #             return False
-    #         return bool(result) if isinstance(result, (bool, int)) else False
-
-    #     def _first_non_null(series: pd.Series) -> Any:
-    #         for value in series:
-    #             if _is_missing(value):
-    #                 continue
-    #             return value
-    #         return None
-
-    #     for column in prepared.columns:
-    #         sample = _first_non_null(prepared[column])
-    #         if isinstance(sample, BaseGeometry):
-    #             prepared[column] = prepared[column].apply(
-    #                 lambda geom: geom.wkb_hex if isinstance(geom, BaseGeometry) else None
-    #             )
-    #         elif isinstance(sample, (list, dict)):
-    #             prepared[column] = prepared[column].apply(
-    #                 lambda value: (
-    #                     json.dumps(value)
-    #                     if not _is_missing(value)
-    #                     else None
-    #                 )
-    #             )
-
-    #     suffix = re.sub(r"[^0-9a-zA-Z_]", "_", str(self.SOURCE).lower())
-    #     if not suffix:
-    #         suffix = "default"
-    #     if suffix[0].isdigit():
-    #         suffix = f"u_{suffix}"
-    #     table_name = f"universe_{suffix}"
-
-    #     try:
-    #         with duckdb.connect(str(db_path)) as conn:
-    #             conn.register("universe_df", prepared)
-    #             conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-    #             conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM universe_df")
-    #             conn.unregister("universe_df")
-    #     except duckdb.Error as exc:  # type: ignore[attr-defined]
-    #         logger.error("Failed to persist universe '%s' to %s: %s", self.SOURCE, db_path, exc)
+    #         locations_clipped = self.locations
+    # 
+    #     return locations_clipped

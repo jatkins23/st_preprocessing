@@ -66,7 +66,7 @@ class LocationGeometry(BaseModel):
         bbox = _get_bounds_from_gridboxes(grid_bboxes)
         return bbox
         
-        
+    @staticmethod
     def _get_projected_bounds_from_geometric_bounds(bbox:list[float], output_crs):
         transformer = Transformer.from_crs("EPSG:4326", output_crs, always_xy=True)
         minx, miny = transformer.transform(bbox[0], bbox[1])
@@ -101,6 +101,4 @@ class LocationGeometry(BaseModel):
         if v is None or (v and isinstance(v[0], mercantile.Tile)):
             return v
         return [mercantile.Tile(x=int(d['x']), y=int(d['y']), z=int(d['z'])) for d in v]
-
-    
 

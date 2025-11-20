@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from ..universe import UniverseLoader
 from ...utils.nyc_geocoding.normalizers import StreetNormalizer
-from ...pipeline_mixin import PipelineMixin
+from ...utils.pipeline_mixin import PipelineMixin
 
 load_dotenv()
 
