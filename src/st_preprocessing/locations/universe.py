@@ -229,7 +229,8 @@ class UniverseLoader(DataLoader):
         cls,
         universe_name: str,
         source: str | None = None,
-        required: bool = True
+        required: bool = True,
+        **kwargs: Any
     ) -> Universe | None:
         """Load universe from database by name.
 
