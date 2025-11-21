@@ -4,6 +4,8 @@ import os
 
 class Settings(BaseSettings):
     ddb_path: Path = Path(str(os.getenv('DDB_PATH')))
+    data_path: Path | None = None
+    proj_crs: int | None = None
 
     class Config: 
         env_prefix = ""
