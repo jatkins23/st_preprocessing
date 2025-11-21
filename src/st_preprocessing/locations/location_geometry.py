@@ -8,26 +8,27 @@ class LocationGeometry(BaseModel):
     location_id: int
     centroid: tuple[float, float]
     tile_width: int                           = 3
-    zlevel: int                               = 20 
+    zlevel: int                               = 20
     proj_crs: str                             = 'EPSG:2263'
-    
+
     # Derived & Cacheable
     bounds_gcs:  list[float] | None           = None
     bounds_proj: list[float] | None           = None
     center_tile: mercantile.Tile | None       = None
     centroid_p: tuple[float, float] | None    = None
     tile_grid: list[mercantile.Tile] | None   = None
-    
+
     # Post-init computes the derived fields
     def model_post_init(self, __context):
-        # Only compute if missing so that I can load from the cache when necessary
+    
+        # TODO: Only compute if missing so that I can load from the cache when necessary
 
         # Tiles
         self.center_tile = self.center_tile or mercantile.tile(self.centroid[0], self.centroid[1], self.zlevel)
         self.tile_grid = self.tile_grid or self._generate_tile_grid_from_center_tile(self.center_tile, self.tile_width)
-        
+
         # generate_bounds
-        self.bounds_gcs = self.bounds_gcs or self._get_geometric_bounds_from_tile_grid(self.tile_grid) 
+        self.bounds_gcs = self.bounds_gcs or self._get_geometric_bounds_from_tile_grid(self.tile_grid)
         self.bounds_proj = self.bounds_proj or self._get_projected_bounds_from_geometric_bounds(self.bounds_gcs, self.proj_crs)
 
         if self.centroid_p is None:

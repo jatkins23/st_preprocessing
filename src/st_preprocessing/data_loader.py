@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Type, Optional
 import logging
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 import geopandas as gpd
@@ -49,20 +51,43 @@ class DataLoader(ABC):
             logger.debug(f"Registered DataLoader modality: {cls.__name__} as '{key}'")
 
     @classmethod
-    def load(cls, modality: str, source: str, **kwargs: Any) -> Any:
+    def _require_method(cls, modality_cls: Type, method_name: str, hint: str = "") -> None:
+        """Check if a modality class has a required method.
+
+        Args:
+            modality_cls: The modality class to check
+            method_name: Name of the method that must exist
+            hint: Optional hint to add to the error message
+
+        Raises:
+            AttributeError: If the modality class doesn't implement the required method
+        """
+        if not hasattr(modality_cls, method_name):
+            error_msg = f"Modality loader {modality_cls.__name__} does not implement {method_name}()"
+            if hint:
+                error_msg += f". {hint}"
+            raise AttributeError(error_msg)
+
+    @classmethod
+    def load(cls, modality: str, source: str, from_db: bool = False, universe_name: str | None = None, **kwargs: Any) -> Any:
         """Factory method to load data by modality and source.
 
         Args:
             modality: The data modality (e.g., 'universe', 'features', 'projects', 'imagery')
             source: The specific source within that modality (e.g., 'lion', 'census', 'nyc')
-            **kwargs: Arguments passed to the source loader's __init__
+            from_db: If True, load from database instead of source (default: False)
+            universe_name: Name of universe (and schema). Defaults to 'source'.
+            **kwargs: Arguments passed to the source loader's methods
 
         Returns:
             Loaded data from the specified modality and source
 
         Example:
-            # Load LION universe data
+            # Load LION universe data from source
             universe = DataLoader.load(modality='universe', source='lion')
+
+            # Load from database
+            universe = DataLoader.load(modality='universe', source='lion', from_db=True)
 
             # Load census features
             features = DataLoader.load(modality='features', source='census', year=2020)
@@ -76,12 +101,17 @@ class DataLoader(ABC):
                 f"Known modalities: {sorted(cls._MODALITY_REGISTRY.keys())}"
             ) from e
 
-        # Dispatch to the modality loader's from_source method
-        if not hasattr(modality_cls, 'from_source'):
-            raise AttributeError(
-                f"Modality loader {modality_cls.__name__} does not implement from_source()"
-            )
+        # Load from database if requested
+        if from_db:
+            # Use source as universe_name for from_db
+            if universe_name is None:
+                universe_name = source
 
+            cls._require_method(modality_cls, 'from_db', hint="Use from_db=False to load from source")
+            return modality_cls.from_db(universe_name=universe_name, source=source, **kwargs)
+
+        # Dispatch to the modality loader's from_source method
+        cls._require_method(modality_cls, 'from_source')
         return modality_cls.from_source(source, **kwargs)
 
     @abstractmethod
@@ -133,40 +163,35 @@ class DataLoader(ABC):
             else:
                 full_name = table_name
 
-            # Handle GeoDataFrame geometry column
-            geom_col = None
+            # Handle GeoDataFrame with geometries using GeoParquet
             if isinstance(df, gpd.GeoDataFrame) and df.geometry is not None:
-                geom_col = df.geometry.name
-                # Convert to regular DataFrame and replace geometry with WKT
-                df_to_save = pd.DataFrame(df.drop(columns=[geom_col]))
-                df_to_save[geom_col] = df.geometry.apply(
-                    lambda geom: geom.wkt if geom is not None else None
-                )
-            else:
-                df_to_save = df.copy()
+                # Install and load spatial extension
+                db_con.execute("INSTALL spatial;")
+                db_con.execute("LOAD spatial;")
+                db_con.execute("CALL register_geoarrow_extensions()")
 
-            # Register DataFrame and create table
-            db_con.register("_tmp_gdf", df_to_save)
-            try:
+                # Save as GeoParquet
+                df_arrow = df.to_arrow()
+
+                # Drop existing table
                 db_con.execute(f"DROP TABLE IF EXISTS {full_name};")
 
-                # If GeoDataFrame, convert WKT to geometry in the table
-                if geom_col:
-                    # Get all non-geometry columns
-                    other_cols = [col for col in df_to_save.columns if col != geom_col]
-                    cols_select = ", ".join(other_cols)
+                # Load GeoParquet directly into DuckDB (preserves geometry)
+                db_con.execute(f"""
+                    CREATE TABLE {full_name} AS
+                    SELECT * FROM df_arrow;
+                """)
 
-                    db_con.execute(f"""
-                        CREATE TABLE {full_name} AS
-                        SELECT {cols_select},
-                               ST_GeomFromText({geom_col}) AS {geom_col}
-                        FROM _tmp_gdf
-                    """)
-                else:
+                logger.info(f"Saved {len(df)} rows to {full_name} (via GeoParquet)")
+                
+            else:
+                # Regular DataFrame - direct registration
+                db_con.register("_tmp_gdf", df)
+                try:
+                    db_con.execute(f"DROP TABLE IF EXISTS {full_name};")
                     db_con.execute(f"CREATE TABLE {full_name} AS SELECT * FROM _tmp_gdf;")
-
-                logger.info(f"Saved {len(df)} rows to {full_name}")
-            finally:
-                db_con.unregister("_tmp_gdf")
+                    logger.info(f"Saved {len(df)} rows to {full_name}")
+                finally:
+                    db_con.unregister("_tmp_gdf")
 
         return full_name

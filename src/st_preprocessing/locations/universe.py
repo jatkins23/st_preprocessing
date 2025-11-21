@@ -13,7 +13,6 @@ import geopandas as gpd
 from shapely.geometry import Polygon
 from shapely.geometry.base import BaseGeometry
 from pydantic import BaseModel, ValidationError
-import mercantile
 
 from ..utils.errors import DataValidationError
 from .location import Location
@@ -115,15 +114,17 @@ class UniverseLoader(DataLoader):
         loader = loader_cls()
 
         if kwargs.get('with_geometries', True):
+            print('loading with geometries')
             universe = loader.load_with_geometries(**kwargs)
         else:
+            print('loading without geometries')
             universe = loader.load(**kwargs)
 
-        # Optionall persist
+        # Optionally persist
         if persist:
             loader.persist(universe)
 
-        return loader.load(**kwargs)
+        return universe
 
     def load(self, **kwargs) -> Universe:
         """Load universe data from source.
@@ -156,7 +157,7 @@ class UniverseLoader(DataLoader):
         # Create location geometries
         location_geoms = self._create_location_geometries(
             uni.locations,
-            tile_widt=tile_width,
+            tile_width=tile_width,
             zlevel=zlevel
         )
 
@@ -180,47 +181,142 @@ class UniverseLoader(DataLoader):
                 table_name='locations',
                 schema_name=universe.name
             )
-        
+
         if write_geometries and universe.location_geometries is not None:
             super().to_database(
                 df=universe.location_geometries,
                 table_name='location_geometries',
                 schema_name=universe.name
             )
+
+    @classmethod
+    def _universe_exists_in_db(cls, universe_name: str) -> bool:
+        """Check if a universe exists in the database.
+
+        Args:
+            universe_name: Name of the universe to check
+
+        Returns:
+            True if the universe exists in the database, False otherwise
+        """
+        try:
+            with duckdb_connection() as db_con:
+                # Check if schema exists
+                result = db_con.execute(f"""
+                    SELECT COUNT(*)
+                    FROM information_schema.schemata
+                    WHERE schema_name = '{universe_name}'
+                """).fetchone()
+
+                if result[0] == 0:
+                    return False
+
+                # Check if locations table exists
+                result = db_con.execute(f"""
+                    SELECT COUNT(*)
+                    FROM information_schema.tables
+                    WHERE table_schema = '{universe_name}'
+                    AND table_name = 'locations'
+                """).fetchone()
+
+                return result[0] > 0
+        except Exception as e:
+            logger.error(f"Error checking if universe exists: {e}")
+            return False
+
+    @classmethod
+    def from_db(
+        cls,
+        universe_name: str,
+        source: str | None = None,
+        required: bool = True
+    ) -> Universe | None:
+        """Load universe from database by name.
+
+        Args:
+            universe_name: Name of the universe in the database
+            source: Optional source identifier (defaults to universe_name if in registry)
+            required: If True, raise error if not found. If False, return None (default: True)
+
+        Returns:
+            Universe object or None if not found and required=False
+
+        Raises:
+            ValueError: If universe not found and required=True
+
+        Example:
+            # Load from database (error if not found)
+            universe = UniverseLoader.from_db('lion')
+
+            # Load from database (return None if not found)
+            universe = UniverseLoader.from_db('lion', required=False)
+        """
+        if not cls._universe_exists_in_db(universe_name):
+            if required:
+                raise ValueError(
+                    f"Universe '{universe_name}' not found in database. "
+                    f"Use UniverseLoader.from_source() to load from source first."
+                )
+            else:
+                logger.info(f"Universe '{universe_name}' not found in database")
+                return None
+
+        return cls.from_database(universe_name, source=source)
         
     @classmethod
-    def from_database(cls, universe_name: str, source: str | None=None) -> Universe:
-        """
-            Load universe from database.
-        """
-        if source is None and universe_name.lower() in cls._REGISTRY.keys():
-            source = universe_name
+    def from_database(cls, universe_name: str, source: str) -> Universe:
+        """Load universe from database (internal method).
 
-        if source.lower() not in cls._REGISTRY.keys():
-            logger.error(
-                'Source not in '
+        Args:
+            universe_name: Name of the universe in the database
+            source: Optional source identifier
+
+        Returns:
+            Universe object with locations and location_geometries
+
+        Note:
+            Use from_db() instead for better error handling.
+        """
+        if source and source.lower() not in cls._REGISTRY.keys():
+            logger.warning(
+                f"Source '{source}' not in registry. "
+                f"Known sources: {sorted(cls._REGISTRY.keys())}"
             )
 
         with duckdb_connection() as db_con:
-            locations_gdf = load_wkt_gdf(
-                db_con,
-                table_name='locations',
-                table_schema=universe_name,
-                geom_col='geometry'
-            )
+            # Load locations
+            # locations_gdf = load_wkt_gdf(
+            #     db_con,
+            #     table_name='locations',
+            #     table_schema=universe_name,
+            #     geom_col='geometry'
+            # )
+            locations_gdf = gpd.GeoDataFrame(db_con.execute(f'SELECT * FROM {universe_name}.locations;').df())
+            logger.info(f"Loaded {len(locations_gdf)} locations from database")
 
+            # Load location_geometries
             try:
                 location_geoms_df = db_con.execute(
                     f"SELECT * FROM {universe_name}.location_geometries;"
                 ).df()
-            except Exception:
+                logger.info(f"Loaded {len(location_geoms_df)} location geometries from database")
+            except Exception as e:
+                logger.warning(f"Could not load location_geometries from {universe_name}.location_geometries: {e}")
                 location_geoms_df = None
 
-        return Universe(
-            source=universe_name,
+        universe = Universe(
+            source=source,
             name=universe_name,
-            locations=locations_gdf
+            locations=locations_gdf,
+            location_geometries=location_geoms_df
         )
+
+        logger.info(
+            f"Loaded universe '{universe_name}' with {len(universe.locations)} locations "
+            f"and {len(universe.location_geometries) if universe.location_geometries is not None else 0} geometries"
+        )
+
+        return universe
 
     def _validate_df_to_models(self, raw_df: gpd.GeoDataFrame|pd.DataFrame, model: BaseModel) -> Iterable[BaseModel]:
         """Validate dataframe with given pydantic model."""
@@ -258,9 +354,15 @@ class UniverseLoader(DataLoader):
         if locations_gdf.crs != 'EPSG:4326':
             locations_gdf = locations_gdf.to_crs('EPSG:4326')
         
-        location_models = _validate_df_to_models(locations_gdf, Location) # This can be handled again with the universe @property
+        location_models = self._validate_df_to_models(locations_gdf, Location) # This can be handled again with the universe @property
         location_geom_instances = [
-            LocationGeometry(location_id=loc['location_id'], centroid=(loc['geometry'].x, loc['geometry'].y), tile_width=tile_width, zlevel=zlevel, proj_crs=self.CRS) 
+            LocationGeometry(
+                location_id=loc.location_id,
+                centroid=(loc.geometry.x, loc.geometry.y),
+                tile_width=tile_width,
+                zlevel=zlevel,
+                proj_crs=self.CRS
+            )
             for loc in location_models
         ]
         location_geoms = pd.DataFrame([lg.model_dump() for lg in location_geom_instances])

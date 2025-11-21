@@ -55,22 +55,26 @@ class PipelineMixin:
             Result from the final pipeline step
         """
         pipeline = self._load_pipeline(**pipeline_kwargs)
-        results = {}
+        print(pipeline)
+        result = None
 
-        for name, func, args, kwargs in pipeline:
+        for name, func, kwargs in pipeline:
             try:
-                results[name] = func(*args, **kwargs)
+                if result is not None:
+                    result = func(result, **kwargs)
+                else:
+                    result = func(**kwargs)
                 if progress:
-                    self._print_step_success(name)
+                    self._log_step_success(name)
             except Exception as e:
-                self._print_step_failure(name, e)
+                self._log_step_failure(name, e)
                 raise
 
         # Return the result of the last step
-        final_step_name = [x[0] for x in pipeline][-1]
-        return results[final_step_name]
+        # final_step_name = [x[0] for x in pipeline][-1]
+        return result
 
-    def _print_step_success(self, step_name: str) -> None:
+    def _log_step_success(self, step_name: str) -> None:
         """Print success message for a pipeline step."""
         # Calculate padding for alignment
         max_len = len('Consolidate Intersections')  # Longest typical step name
@@ -79,7 +83,7 @@ class PipelineMixin:
         modality = getattr(self, 'MODALITY', 'Loader').title()
         print(f'{modality} -- {step_name} {"-" * padding}> {Fore.GREEN}Complete{Style.RESET_ALL}')
 
-    def _print_step_failure(self, step_name: str, error: Exception) -> None:
+    def _log_step_failure(self, step_name: str, error: Exception) -> None:
         """Print failure message for a pipeline step."""
         max_len = len('Consolidate Intersections')
         padding = max_len - len(step_name) + 4
