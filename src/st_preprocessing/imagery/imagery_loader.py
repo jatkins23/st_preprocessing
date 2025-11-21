@@ -194,18 +194,21 @@ class ImageryLoader(DataLoader):
         source: ImagerySource,
         save_dir: Path | str,
         zlevel: int | None = None,
+        n_workers: int = 4,
         **kwargs: Any
     ) -> dict[int, Path]:
         """Load and save imagery for all locations in a universe.
 
         This wrapper function iterates over universe.location_geometries,
-        loads imagery for each bounds, and saves it to disk.
+        loads imagery for each bounds, and saves it to disk. Uses batch
+        fetching with multithreading for improved performance.
 
         Args:
             universe: Universe object with location_geometries
             source: ImagerySource strategy for fetching imagery
             save_dir: Directory to save images
             zlevel: Optional zoom level override (uses universe's zlevel if None)
+            n_workers: Number of worker threads for parallel fetching (default: 4)
             **kwargs: Additional arguments passed to the source
 
         Returns:
@@ -224,11 +227,12 @@ class ImageryLoader(DataLoader):
                 cache_dir='./tile_cache'
             )
 
-            # Load and save imagery for all locations
+            # Load and save imagery for all locations (using 4 threads)
             image_paths = ImageryLoader.load_from_universe(
                 universe=universe,
                 source=source,
-                save_dir='./images/lion'
+                save_dir='./images/lion',
+                n_workers=4
             )
         """
         if universe.location_geometries is None:
@@ -240,45 +244,68 @@ class ImageryLoader(DataLoader):
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        image_paths = {}
         geoms_df = universe.location_geometries
 
         logger.info(f"Loading imagery for {len(geoms_df)} locations from universe '{universe.name}'")
 
-        # Create progress bar
-        with tqdm(total=len(geoms_df), desc="Loading imagery", unit="img") as pbar:
-            for _, row in geoms_df.iterrows():
-                location_id = row['location_id']
-                bounds_gcs = row['bounds_gcs']
-                location_zlevel = zlevel if zlevel is not None else row['zlevel']
+        # Prepare data for batch fetching
+        location_ids = []
+        bounds_list = []
 
-                # Convert bounds_gcs to tuple if it's a list
-                if isinstance(bounds_gcs, list):
-                    bounds_gcs = tuple(bounds_gcs)
+        for _, row in geoms_df.iterrows():
+            location_ids.append(row['location_id'])
+            bounds_gcs = row['bounds_gcs']
 
-                logger.debug(f"Loading imagery for location_id={location_id}, bounds={bounds_gcs}")
+            # Convert bounds_gcs to tuple if it's a list
+            if isinstance(bounds_gcs, list):
+                bounds_gcs = tuple(bounds_gcs)
+
+            bounds_list.append(bounds_gcs)
+
+        # Determine zlevel to use
+        if zlevel is None:
+            # Use the first zlevel from the dataframe (assuming all are the same)
+            zlevel = geoms_df.iloc[0]['zlevel']
+
+        # Batch fetch all images using multithreading
+        logger.info(f"Fetching {len(bounds_list)} images with {n_workers} workers")
+        images = source.fetch_batch(
+            bounds_list=bounds_list,
+            zlevel=zlevel,
+            n_workers=n_workers,
+            show_progress=True,
+            **kwargs
+        )
+
+        # Save all images with progress bar
+        image_paths = {}
+        failed_count = 0
+
+        logger.info(f"Saving {len(images)} images to {save_dir}")
+        with tqdm(total=len(images), desc="Saving images", unit="img") as pbar:
+            for location_id, img in zip(location_ids, images):
+                if img is None:
+                    failed_count += 1
+                    logger.warning(f"Skipping location_id={location_id} (fetch failed)")
+                    pbar.update(1)
+                    continue
 
                 try:
-                    # Fetch image using the source
-                    img = source.fetch(bounds_gcs, zlevel=location_zlevel, **kwargs)
-
-                    # Save image
                     image_path = save_dir / f"{location_id}.png"
                     img.save(image_path)
-
                     image_paths[location_id] = image_path
-                    logger.debug(f"Saved image for location_id={location_id} to {image_path}")
-
-                    pbar.set_postfix({'saved': len(image_paths), 'failed': pbar.n - len(image_paths)})
-
+                    pbar.set_postfix({'saved': len(image_paths), 'failed': failed_count})
                 except Exception as e:
-                    logger.error(f"Failed to load imagery for location_id={location_id}: {e}")
-                    pbar.set_postfix({'saved': len(image_paths), 'failed': pbar.n + 1 - len(image_paths)})
-
+                    failed_count += 1
+                    logger.error(f"Failed to save image for location_id={location_id}: {e}")
+                    pbar.set_postfix({'saved': len(image_paths), 'failed': failed_count})
                 finally:
                     pbar.update(1)
 
-        logger.info(f"Successfully loaded and saved {len(image_paths)} images to {save_dir}")
+        logger.info(
+            f"Successfully loaded and saved {len(image_paths)} images to {save_dir} "
+            f"({failed_count} failed)"
+        )
 
         return image_paths
 

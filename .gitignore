@@ -10,3 +10,6 @@ notebooks/cache
 *.ipynb_checkpoint*
 notebooks/images/*
 notebooks/tile_cache/*
+*.ddb
+*.DS_Store
+zzz*
