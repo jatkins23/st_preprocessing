@@ -5,8 +5,11 @@ from typing import Iterable, Any, ClassVar, TYPE_CHECKING
 from pathlib import Path
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import os
 
 from tqdm import tqdm
+import pandas as pd
 
 from .source_strategies import ImagerySource, LocalFileSource, CachedSource, TileStitchingSource
 from ..data_loader import DataLoader
@@ -196,6 +199,7 @@ class ImageryLoader(DataLoader):
         save_dir: Path | str,
         zlevel: int = 20,
         n_workers: int = 4,
+        update_db_metadata: bool = True,
         **kwargs: Any
     ) -> dict[int, Path]:
         """Load and save imagery for all locations in a universe.
@@ -210,6 +214,7 @@ class ImageryLoader(DataLoader):
             save_dir: Directory to save images
             zlevel: Optional zoom level override (uses universe's zlevel if None)
             n_workers: Number of worker threads for parallel fetching (default: 4)
+            update_db_metadata: Whether to register files in database (default: True)
             **kwargs: Additional arguments passed to the source
 
         Returns:
@@ -307,7 +312,281 @@ class ImageryLoader(DataLoader):
             f"({failed_count} failed)"
         )
 
+        # Register files to database if requested
+        if update_db_metadata:
+            # Extract year from source
+            if hasattr(source, 'year'):
+                cls._register_files_to_db(
+                    universe_name=universe.name,
+                    image_paths=image_paths,
+                    year=source.year,
+                    save_dir=save_dir
+                )
+            else:
+                logger.warning(
+                    "Source does not have a 'year' attribute. "
+                    "Skipping database metadata registration. "
+                    "Use a source with year attribute (e.g., NewYork(year=2024))"
+                )
+
         return image_paths
+
+    @classmethod
+    def _create_metadata_table(cls, universe_name: str) -> None:
+        """Create location_year_files table in universe schema if it doesn't exist.
+
+        Args:
+            universe_name: Name of the universe (used as schema name)
+        """
+        from ..db.db import duckdb_connection
+        from ..settings import settings
+
+        with duckdb_connection() as db_con:
+            # Create schema if it doesn't exist
+            db_con.execute(f"CREATE SCHEMA IF NOT EXISTS {universe_name}")
+
+            # Create location_year_files table
+            db_con.execute(f"""
+                CREATE TABLE IF NOT EXISTS {universe_name}.location_year_files (
+                    location_id INTEGER NOT NULL,
+                    universe_name VARCHAR NOT NULL,
+                    year INTEGER NOT NULL,
+                    file_type VARCHAR NOT NULL,
+                    file_path_abs VARCHAR NOT NULL,
+                    file_path_rel VARCHAR NOT NULL,
+                    file_size INTEGER,
+                    exists BOOLEAN DEFAULT TRUE,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_date TIMESTAMP,
+                    PRIMARY KEY (location_id, year, file_type)
+                )
+            """)
+
+            logger.debug(f"Created/verified location_year_files table in schema {universe_name}")
+
+    @classmethod
+    def _register_files_to_db(
+        cls,
+        universe_name: str,
+        image_paths: dict[int, Path],
+        year: int,
+        save_dir: Path | str
+    ) -> None:
+        """Register image files to database metadata table.
+
+        Only adds new files (doesn't update existing records).
+
+        Args:
+            universe_name: Name of the universe
+            image_paths: Dictionary mapping location_id to image path
+            year: Year of imagery
+            save_dir: Base directory where images are saved
+        """
+        from ..db.db import duckdb_connection
+        from ..settings import settings
+
+        # Create table if needed
+        cls._create_metadata_table(universe_name)
+
+        save_dir = Path(save_dir)
+        export_path = settings.export_path
+
+        # Build metadata DataFrame
+        records = []
+        for location_id, file_path in image_paths.items():
+            file_path = Path(file_path)
+
+            # Calculate relative path from export_path
+            try:
+                file_path_rel = file_path.relative_to(export_path / 'imagery')
+            except ValueError:
+                # If file is not under export_path, use relative to save_dir
+                file_path_rel = file_path.relative_to(save_dir.parent)
+
+            # Get file metadata
+            if file_path.exists():
+                file_size = file_path.stat().st_size
+                updated_date = datetime.fromtimestamp(file_path.stat().st_mtime)
+                exists = True
+            else:
+                file_size = None
+                updated_date = None
+                exists = False
+
+            records.append({
+                'location_id': location_id,
+                'universe_name': universe_name,
+                'year': year,
+                'file_type': 'image',
+                'file_path_abs': str(file_path.absolute()),
+                'file_path_rel': str(file_path_rel),
+                'file_size': file_size,
+                'exists': exists,
+                'updated_date': updated_date
+            })
+
+        if not records:
+            logger.info("No image files to register in database")
+            return
+
+        metadata_df = pd.DataFrame(records)
+
+        with duckdb_connection() as db_con:
+            # Upsert: Insert new records or update if anything changed
+            db_con.register('_tmp_metadata', metadata_df)
+            try:
+                # Count existing records before upsert to calculate inserts
+                existing_count = db_con.execute(f"""
+                    SELECT COUNT(*)
+                    FROM {universe_name}.location_year_files t
+                    JOIN _tmp_metadata m
+                        ON t.location_id = m.location_id
+                        AND t.year = m.year
+                        AND t.file_type = m.file_type
+                """).fetchone()[0]
+
+                db_con.execute(f"""
+                    INSERT INTO {universe_name}.location_year_files
+                        (location_id, universe_name, year, file_type, file_path_abs,
+                         file_path_rel, file_size, exists, updated_date)
+                    SELECT location_id, universe_name, year, file_type, file_path_abs,
+                           file_path_rel, file_size, exists, updated_date
+                    FROM _tmp_metadata
+                    ON CONFLICT (location_id, year, file_type)
+                    DO UPDATE SET
+                        file_path_abs = excluded.file_path_abs,
+                        file_path_rel = excluded.file_path_rel,
+                        file_size = excluded.file_size,
+                        exists = excluded.exists,
+                        updated_date = excluded.updated_date
+                    WHERE
+                        {universe_name}.location_year_files.file_path_abs != excluded.file_path_abs OR
+                        {universe_name}.location_year_files.file_size != excluded.file_size OR
+                        {universe_name}.location_year_files.exists != excluded.exists OR
+                        {universe_name}.location_year_files.updated_date != excluded.updated_date
+                """)
+
+                # Log statistics
+                new_records = len(metadata_df) - existing_count
+                logger.info(
+                    f"Processed {len(metadata_df)} files: "
+                    f"~{new_records} new, ~{existing_count} existing (may have updated)"
+                )
+            finally:
+                db_con.unregister('_tmp_metadata')
+
+    @classmethod
+    def sync_metadata_from_disk(
+        cls,
+        universe_name: str,
+        base_path: Path | str,
+        years: list[int] | None = None,
+        skip_download: bool = True
+    ) -> pd.DataFrame:
+        """Sync database metadata from existing files on disk.
+
+        This method scans disk for existing image files and updates the database
+        metadata table without downloading any new images.
+
+        Args:
+            universe_name: Name of the universe
+            base_path: Base path to imagery directory (e.g., EXPORT_PATH/imagery/lion)
+            years: List of years to sync (defaults to all subdirectories that look like years)
+            skip_download: If True, only register existing files (default: True)
+
+        Returns:
+            DataFrame of registered file metadata
+
+        Example:
+            # Sync all years found on disk
+            ImageryLoader.sync_metadata_from_disk(
+                universe_name='lion',
+                base_path=settings.export_path / 'imagery' / 'lion'
+            )
+
+            # Sync specific years
+            ImageryLoader.sync_metadata_from_disk(
+                universe_name='lion',
+                base_path=settings.export_path / 'imagery' / 'lion',
+                years=[2020, 2022, 2024]
+            )
+        """
+        from ..settings import settings
+
+        base_path = Path(base_path)
+
+        if not base_path.exists():
+            raise FileNotFoundError(f"Base path does not exist: {base_path}")
+
+        # Auto-detect years from directory structure if not provided
+        if years is None:
+            years = []
+            for item in base_path.iterdir():
+                if item.is_dir() and item.name.isdigit():
+                    years.append(int(item.name))
+            years.sort()
+            logger.info(f"Auto-detected years: {years}")
+
+        if not years:
+            logger.warning(f"No years to sync in {base_path}")
+            return pd.DataFrame()
+
+        # Scan each year directory for image files
+        all_records = []
+
+        with tqdm(total=len(years), desc="Syncing years", unit="year") as year_pbar:
+            for year in years:
+                year_dir = base_path / str(year)
+
+                if not year_dir.exists():
+                    logger.warning(f"Year directory does not exist: {year_dir}")
+                    year_pbar.update(1)
+                    continue
+
+                # Find all PNG files (assumes {location_id}.png naming)
+                image_files = list(year_dir.glob('*.png'))
+                logger.info(f"Found {len(image_files)} images for year {year}")
+
+                # Build image_paths dict with progress bar
+                image_paths = {}
+                with tqdm(total=len(image_files), desc=f"Scanning {year}", unit="file", leave=False) as file_pbar:
+                    for img_file in image_files:
+                        # Extract location_id from filename
+                        try:
+                            location_id = int(img_file.stem)
+                            image_paths[location_id] = img_file
+                        except ValueError:
+                            logger.warning(f"Skipping file with non-numeric name: {img_file.name}")
+                        finally:
+                            file_pbar.update(1)
+
+                # Register files to database
+                if image_paths:
+                    cls._register_files_to_db(
+                        universe_name=universe_name,
+                        image_paths=image_paths,
+                        year=year,
+                        save_dir=year_dir
+                    )
+                    all_records.extend(image_paths.keys())
+
+                year_pbar.set_postfix({'files': len(image_paths), 'total': len(all_records)})
+                year_pbar.update(1)
+
+        logger.info(f"Synced {len(all_records)} total files across {len(years)} years")
+
+        # Return summary of registered files
+        from ..db.db import duckdb_connection
+        with duckdb_connection() as db_con:
+            result_df = db_con.execute(f"""
+                SELECT *
+                FROM {universe_name}.location_year_files
+                WHERE year IN ({','.join(map(str, years))})
+                AND file_type = 'image'
+                ORDER BY year, location_id
+            """).df()
+
+        return result_df
 
     def _validate(self):
         """Validate loaded imagery data.

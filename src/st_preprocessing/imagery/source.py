@@ -12,7 +12,7 @@ class ImagerySource(ABC):
 class NewYork(ImagerySource):
     name = 'nyc'
     keyword = ('New York City', 'City of New York')
-    years = list(range(2006, 2024, 2))
+    years = list(range(2006, 2025, 2))
     URL_TEMPLATE = (
         "https://tiles.arcgis.com/tiles/yG5s3afENB5iO9fj/arcgis/rest/"
         "services/NYC_Orthos_{year}/MapServer/tile/{{z}}/{{y}}/{{x}}"

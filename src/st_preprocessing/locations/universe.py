@@ -114,10 +114,10 @@ class UniverseLoader(DataLoader):
         loader = loader_cls()
 
         if kwargs.get('with_geometries', True):
-            print('loading with geometries')
+            logger.debug('loading with geometries')
             universe = loader.load_with_geometries(**kwargs)
         else:
-            print('loading without geometries')
+            logger.debug('loading without geometries')
             universe = loader.load(**kwargs)
 
         # Optionally persist

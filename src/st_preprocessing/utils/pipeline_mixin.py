@@ -55,7 +55,6 @@ class PipelineMixin:
             Result from the final pipeline step
         """
         pipeline = self._load_pipeline(**pipeline_kwargs)
-        print(pipeline)
         result = None
 
         for name, func, kwargs in pipeline:
