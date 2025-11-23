@@ -418,6 +418,36 @@ class TileStitchingSource(ImagerySource):
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # Create persistent session for connection pooling
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        # Set connection pool size (large enough for parallel workers)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=200,  
+            max_retries=3
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+
+    def __del__(self):
+        """Cleanup session on deletion to avoid resource leaks."""
+        if hasattr(self, 'session'):
+            self.session.close()
+
+    def cleanup(self):
+        """Explicitly cleanup session and connection pools to avoid semaphore leaks.
+
+        This method clears the connection pool and closes the session more aggressively
+        than just calling session.close().
+        """
+        if hasattr(self, 'session') and self.session is not None:
+            # Clear all adapters to cleanup their connection pools
+            for adapter in self.session.adapters.values():
+                adapter.close()
+            # Close the session itself
+            self.session.close()
+
     def _get_tile_url(self, tile: mercantile.Tile) -> str:
         """Generate URL for a specific tile."""
         return self.tile_provider.format(z=tile.z, x=tile.x, y=tile.y)
@@ -428,36 +458,73 @@ class TileStitchingSource(ImagerySource):
             return None
         return self.cache_dir / f"{tile.z}_{tile.x}_{tile.y}.png"
 
-    def _fetch_single_tile(self, tile: mercantile.Tile) -> Image.Image:
-        """Fetch a single tile, using cache if available."""
+    def _fetch_single_tile(self, tile: mercantile.Tile, silent: bool = False) -> tuple[Image.Image, bool]:
+        """Fetch a single tile, using cache if available.
+
+        Args:
+            tile: Tile to fetch
+            silent: If True, suppress warning messages (for tqdm compatibility)
+
+        Returns:
+            Tuple of (image, success) where success indicates if tile was fetched successfully
+        """
         cache_path = self._get_tile_cache_path(tile)
 
         # Check cache
         if cache_path and cache_path.exists():
-            logger.debug(f"Loading tile from cache: {cache_path}")
-            return Image.open(cache_path)
+            try:
+                # Verify it's a valid file, not a directory
+                if cache_path.is_dir():
+                    if not silent:
+                        logger.warning(f"Cache path is a directory, removing: {cache_path}")
+                    cache_path.rmdir()
+                else:
+                    # Try to open cached image
+                    logger.debug(f"Loading tile from cache: {cache_path}")
+                    img = Image.open(cache_path)
+                    img.load()  # Force load to detect corrupt files
+                    return img, True
+            except (OSError, IOError):
+                # Cache file is corrupt or unreadable, delete it and re-fetch
+                # Don't log during parallel operations to avoid messing up progress bars
+                try:
+                    cache_path.unlink()
+                except Exception:
+                    pass
 
         # Fetch from provider
         url = self._get_tile_url(tile)
         logger.debug(f"Fetching tile: {url}")
 
         try:
-            response = requests.get(url, headers=self.headers, timeout=10)
+            response = self.session.get(url, timeout=10)
             response.raise_for_status()
 
+            # Verify response has content
+            if not response.content or len(response.content) == 0:
+                raise ValueError(f"Empty response from {url}")
+
             img = Image.open(BytesIO(response.content))
+            img.load()  # Force load to verify it's valid
 
             # Save to cache
             if cache_path:
-                img.save(cache_path)
-                logger.debug(f"Cached tile to: {cache_path}")
+                try:
+                    # Ensure parent directory exists
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    img.save(cache_path)
+                    logger.debug(f"Cached tile to: {cache_path}")
+                except Exception:
+                    # Silently continue if caching fails
+                    pass
 
-            return img
+            return img, True
 
         except Exception as e:
-            logger.error(f"Failed to fetch tile {tile}: {e}")
+            if not silent:
+                logger.error(f"Failed to fetch tile {tile} from {url}: {e}")
             # Return blank tile on error
-            return Image.new('RGB', (self.tile_size, self.tile_size), color='gray')
+            return Image.new('RGB', (self.tile_size, self.tile_size), color='gray'), False
 
     def _get_tiles_for_bounds(self, bounds: tuple[float, float, float, float], zlevel: int) -> list[mercantile.Tile]:
         """Calculate which tiles cover the given bounding box.
@@ -588,6 +655,7 @@ class TileStitchingSource(ImagerySource):
         bounds: tuple[float, float, float, float],
         zlevel: int = 18,
         crop: bool = True,
+        tile_workers: int = 8,
         **kwargs: Any
     ) -> Image.Image:
         """Fetch and stitch tiles for a bounding box.
@@ -596,6 +664,7 @@ class TileStitchingSource(ImagerySource):
             bounds: (west, south, east, north) in WGS84 degrees
             zlevel: Zoom level for tiles (default: 18)
             crop: Whether to crop to exact bounds (default: True)
+            tile_workers: Number of threads for parallel tile fetching (default: 8)
             **kwargs: Additional parameters (reserved for future use)
 
         Returns:
@@ -611,11 +680,42 @@ class TileStitchingSource(ImagerySource):
         # Get tiles needed for this bounding box
         tiles = self._get_tiles_for_bounds(bounds, zlevel)
 
-        # Fetch all tiles
+        # Fetch all tiles in parallel
         tiles_with_images = []
-        for tile in tiles:
-            img = self._fetch_single_tile(tile)
-            tiles_with_images.append((tile, img))
+        tile_errors = 0
+
+        if tile_workers == 1 or len(tiles) == 1:
+            # Serial fetching
+            for tile in tiles:
+                img, success = self._fetch_single_tile(tile, silent=False)
+                tiles_with_images.append((tile, img))
+                if not success:
+                    tile_errors += 1
+        else:
+            # Parallel tile fetching with error tracking
+            with ThreadPoolExecutor(max_workers=tile_workers) as executor:
+                future_to_tile = {
+                    executor.submit(self._fetch_single_tile, tile, True): tile
+                    for tile in tiles
+                }
+
+                for future in as_completed(future_to_tile):
+                    tile = future_to_tile[future]
+                    try:
+                        img, success = future.result()
+                        tiles_with_images.append((tile, img))
+                        if not success:
+                            tile_errors += 1
+                    except Exception as e:
+                        logger.error(f"Error fetching tile {tile}: {e}")
+                        tile_errors += 1
+                        # Add blank tile on error
+                        img = Image.new('RGB', (self.tile_size, self.tile_size), color='gray')
+                        tiles_with_images.append((tile, img))
+
+        # Log tile errors if any occurred (without messing up progress bars)
+        if tile_errors > 0:
+            tqdm.write(f"Warning: {tile_errors}/{len(tiles)} tiles failed to fetch (replaced with gray)")
 
         # Stitch tiles together
         stitched = self._stitch_tiles(tiles_with_images)
@@ -669,6 +769,8 @@ class TileStitchingSource(ImagerySource):
             return [self.fetch(bounds, zlevel=zlevel, **kwargs) for bounds in iterator]
 
         results = [None] * len(bounds_list)
+        failed_images = 0
+
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             future_to_idx = {
                 executor.submit(self.fetch, bounds, zlevel=zlevel, **kwargs): idx
@@ -681,8 +783,12 @@ class TileStitchingSource(ImagerySource):
                     try:
                         results[idx] = future.result()
                     except Exception as e:
-                        logger.error(f"Error fetching bounds {bounds_list[idx]}: {e}")
+                        tqdm.write(f"Error fetching image {idx}: {e}")
                         results[idx] = None
+                        failed_images += 1
+
+                    # Update progress bar with error count
+                    pbar.set_postfix({'failed': failed_images})
                     pbar.update(1)
 
         return results

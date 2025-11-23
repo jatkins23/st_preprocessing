@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Iterable, Any, ClassVar, TYPE_CHECKING
 from pathlib import Path
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
@@ -193,7 +194,7 @@ class ImageryLoader(DataLoader):
         universe: 'Universe',
         source: ImagerySource,
         save_dir: Path | str,
-        zlevel: int | None = None,
+        zlevel: int = 20,
         n_workers: int = 4,
         **kwargs: Any
     ) -> dict[int, Path]:
@@ -249,57 +250,56 @@ class ImageryLoader(DataLoader):
         logger.info(f"Loading imagery for {len(geoms_df)} locations from universe '{universe.name}'")
 
         # Prepare data for batch fetching
-        location_ids = []
-        bounds_list = []
+        location_ids = geoms_df['location_id'].tolist()
+        bounds_list = geoms_df['bounds_gcs'].tolist()
 
-        for _, row in geoms_df.iterrows():
-            location_ids.append(row['location_id'])
-            bounds_gcs = row['bounds_gcs']
+        def _fetch_and_save(location_id: int, bounds: tuple[float, float, float, float]) -> tuple[int, Path | None, Exception | None]:
+            """Fetch a single image and save to disk to avoid retaining all images in memory."""
+            img = None
+            try:
+                img = source.fetch(bounds=bounds, zlevel=zlevel, **kwargs)
+                if img is None:
+                    return location_id, None, None
 
-            # Convert bounds_gcs to tuple if it's a list
-            if isinstance(bounds_gcs, list):
-                bounds_gcs = tuple(bounds_gcs)
+                image_path = save_dir / f"{location_id}.png"
+                img.save(image_path)
+                return location_id, image_path, None
+            except Exception as exc:  # noqa: BLE001
+                return location_id, None, exc
+            finally:
+                if hasattr(img, "close"):
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
 
-            bounds_list.append(bounds_gcs)
-
-        # Determine zlevel to use
-        if zlevel is None:
-            # Use the first zlevel from the dataframe (assuming all are the same)
-            zlevel = geoms_df.iloc[0]['zlevel']
-
-        # Batch fetch all images using multithreading
-        logger.info(f"Fetching {len(bounds_list)} images with {n_workers} workers")
-        images = source.fetch_batch(
-            bounds_list=bounds_list,
-            zlevel=zlevel,
-            n_workers=n_workers,
-            show_progress=True,
-            **kwargs
-        )
+        logger.info(f"Fetching {len(bounds_list)} images with {n_workers} workers (streaming saves to limit memory)")
 
         # Save all images with progress bar
         image_paths = {}
         failed_count = 0
 
-        logger.info(f"Saving {len(images)} images to {save_dir}")
-        with tqdm(total=len(images), desc="Saving images", unit="img") as pbar:
-            for location_id, img in zip(location_ids, images):
-                if img is None:
-                    failed_count += 1
-                    logger.warning(f"Skipping location_id={location_id} (fetch failed)")
-                    pbar.update(1)
-                    continue
+        logger.info(f"Saving {len(bounds_list)} images to {save_dir}")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_fetch_and_save, loc_id, bounds): loc_id
+                for loc_id, bounds in zip(location_ids, bounds_list)
+            }
 
-                try:
-                    image_path = save_dir / f"{location_id}.png"
-                    img.save(image_path)
-                    image_paths[location_id] = image_path
+            with tqdm(total=len(futures), desc="Fetching+Saving images", unit="img") as pbar:
+                for future in as_completed(futures):
+                    location_id, image_path, error = future.result()
+
+                    if error is not None:
+                        failed_count += 1
+                        logger.error(f"Failed to save image for location_id={location_id}: {error}")
+                    elif image_path is None:
+                        failed_count += 1
+                        logger.warning(f"Skipping location_id={location_id} (fetch returned None)")
+                    else:
+                        image_paths[location_id] = image_path
+
                     pbar.set_postfix({'saved': len(image_paths), 'failed': failed_count})
-                except Exception as e:
-                    failed_count += 1
-                    logger.error(f"Failed to save image for location_id={location_id}: {e}")
-                    pbar.set_postfix({'saved': len(image_paths), 'failed': failed_count})
-                finally:
                     pbar.update(1)
 
         logger.info(
