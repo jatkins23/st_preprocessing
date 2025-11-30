@@ -13,3 +13,11 @@ notebooks/tile_cache/*
 *.ddb
 *.DS_Store
 zzz*
+*.npz
+logs/
+original_documents/*
+src/st_preprocessing/documents/*
+tests/*
+FAISS_WHITENING_GUIDE.md
+*embeddings*
+src/st_preprocessing/features/*

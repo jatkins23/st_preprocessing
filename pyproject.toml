@@ -5,12 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    "dash>=3.3.0",
     "dotenv>=0.9.9",
     "duckdb>=1.4.2",
+    "faiss-cpu>=1.13.0",
     "fiona>=1.10.1",
     "geopandas>=1.1.1",
     "matplotlib>=3.10.7",
     "mercantile>=1.2.1",
+    "open-clip-torch>=3.2.0",
     "osmnx>=2.0.6",
     "pandas>=2.3.3",
     "pyarrow>=22.0.0",

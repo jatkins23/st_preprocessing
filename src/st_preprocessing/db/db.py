@@ -14,6 +14,9 @@ def duckdb_connection(read_only: bool = False):
     try:
         con.execute("INSTALL spatial;")
         con.execute("LOAD spatial;")  # if you always want spatial
+        con.execute("INSTALL vss;")
+        con.execute("LOAD vss;")
+        con.execute("SET hnsw_enable_experimental_persistence = true;")
         yield con
     finally:
         con.close()

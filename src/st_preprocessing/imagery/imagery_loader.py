@@ -6,7 +6,6 @@ from pathlib import Path
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import os
 
 from tqdm import tqdm
 import pandas as pd
@@ -587,19 +586,3 @@ class ImageryLoader(DataLoader):
             """).df()
 
         return result_df
-
-    def _validate(self):
-        """Validate loaded imagery data.
-
-        Default implementation does no validation.
-        Subclasses can override to add specific validation logic.
-        """
-        pass
-
-    def _to_database(self):
-        """Save imagery to database.
-
-        Default implementation does nothing.
-        Subclasses can override to implement database persistence.
-        """
-        pass
